@@ -252,33 +252,6 @@ def _check_negation(text, match_start, match_end):
 
 
 # ============================================================================
-# 14 类简化标签（原始 unified_eval.py）
-# ============================================================================
-CLINICAL_LABELS_14 = {
-    "infarction": [r"infarct", r"ischemi", r"stroke", r"infarction"],
-    "hemorrhage": [r"hemorrhag", r"bleed", r"hematoma", r"haemorrhag"],
-    "tumor_mass": [r"tumor", r"mass", r"neoplasm", r"lesion", r"glioma",
-                   r"meningioma", r"metasta"],
-    "atrophy": [r"atroph", r"volume loss", r"parenchymal loss"],
-    "white_matter": [r"white matter", r"leukoaraiosis", r"periventricul",
-                     r"small vessel", r"demyelinat", r"wmh"],
-    "hydrocephalus": [r"hydrocephalus", r"ventriculomegal", r"dilat\w* ventric"],
-    "edema": [r"edema", r"oedema", r"swelling"],
-    "midline_shift": [r"midline shift", r"mass effect", r"herniation"],
-    "vascular": [r"aneurysm", r"avm", r"malformation", r"stenosis",
-                 r"occlusion", r"vascul"],
-    "infection": [r"abscess", r"encephalitis", r"meningitis", r"infect"],
-    "congenital": [r"congenital", r"dysplasia", r"malformation",
-                   r"chiari", r"dandy walker"],
-    "trauma": [r"trauma", r"fracture", r"contusion", r"injur"],
-    "postoperative": [r"post.?op", r"surg", r"resection", r"craniotom",
-                      r"craniectom"],
-    "normal": [r"unremarkable", r"no acute", r"normal", r"within normal",
-               r"no significant", r"no evidence of acute"],
-}
-
-
-# ============================================================================
 # Label Extraction Functions
 # ============================================================================
 def extract_labels_37(report_text):
@@ -295,15 +268,6 @@ def extract_labels_37(report_text):
             if found:
                 break
         labels[label_name] = 1 if found else 0
-    return labels
-
-
-def extract_labels_14(report_text):
-    """14 类简化标签提取"""
-    text = report_text.lower()
-    labels = {}
-    for label_name, patterns in CLINICAL_LABELS_14.items():
-        labels[label_name] = any(re.search(p, text) for p in patterns)
     return labels
 
 
@@ -399,10 +363,6 @@ def compute_clinical_f1_37(pred_labels, ref_labels):
     return _compute_f1_from_dicts(pred_labels, ref_labels, LABEL_37_NAMES)
 
 
-def compute_clinical_f1_14(pred_labels, ref_labels):
-    return _compute_f1_from_dicts(pred_labels, ref_labels, list(CLINICAL_LABELS_14.keys()))
-
-
 # ============================================================================
 # Diversity
 # ============================================================================
@@ -465,44 +425,33 @@ def evaluate(preds, refs, gt_labels_path=None, no_clinical=False):
     print(f"    NLG Avg:  {nlg_avg:.4f}")
 
     # --- Clinical (37 classes) ---
-    clinical_37 = None
+    clinical = None
     if not no_clinical:
         print(f"\n  [Clinical F1 — 37 Classes]  (weight = {WEIGHT_CLINICAL})")
         if gt_labels_path:
             with open(gt_labels_path) as f:
-                gt_labels_37 = json.load(f)
-            pred_labels_37 = [extract_labels_37(r["report"]) for r in preds]
+                gt_labels = json.load(f)
+            pred_labels = [extract_labels_37(r["report"]) for r in preds]
         else:
-            gt_labels_37 = [extract_labels_37(r["report"]) for r in refs]
-            pred_labels_37 = [extract_labels_37(r["report"]) for r in preds]
+            gt_labels = [extract_labels_37(r["report"]) for r in refs]
+            pred_labels = [extract_labels_37(r["report"]) for r in preds]
 
-        clinical_37 = compute_clinical_f1_37(pred_labels_37, gt_labels_37)
-        print(f"    Macro F1: {clinical_37['Clinical_Macro_F1']:.4f}")
-        print(f"    Micro F1: {clinical_37['Clinical_Micro_F1']:.4f}")
+        clinical = compute_clinical_f1_37(pred_labels, gt_labels)
+        print(f"    Macro F1: {clinical['Clinical_Macro_F1']:.4f}")
+        print(f"    Micro F1: {clinical['Clinical_Micro_F1']:.4f}")
 
-        # 逐病理 F1
         print(f"\n    Per-Pathology F1 (37 classes):")
         print(f"    {'Pathology':45s} {'F1':>7s} {'P':>7s} {'R':>7s} {'Supp':>5s}")
         print(f"    {'-'*70}")
-        for name, pc in clinical_37.get("per_pathology", {}).items():
+        for name, pc in clinical.get("per_pathology", {}).items():
             if pc["support"] > 0:
                 p_name = name[:44] if len(name) > 44 else name
                 print(f"    {p_name:45s} {pc['f1']:7.4f} {pc['precision']:7.4f} {pc['recall']:7.4f} {pc['support']:5d}")
 
-        # 难识别疾病提示
-        zero_f1 = [n for n, pc in clinical_37.get("per_pathology", {}).items()
+        zero_f1 = [n for n, pc in clinical.get("per_pathology", {}).items()
                    if pc["support"] > 0 and pc["f1"] == 0.0]
         if zero_f1:
-            print(f"\n    ⚠️  F1=0 的疾病（可能需要针对性 trick）: {', '.join(zero_f1)}")
-
-    # --- Clinical (14 classes) ---
-    if not no_clinical:
-        print(f"\n  [Clinical F1 — 14 Classes (legacy)]")
-        gt_labels_14 = [extract_labels_14(r["report"]) for r in refs]
-        pred_labels_14 = [extract_labels_14(r["report"]) for r in preds]
-        clinical_14 = compute_clinical_f1_14(pred_labels_14, gt_labels_14)
-        print(f"    Macro F1: {clinical_14['Clinical_Macro_F1']:.4f}")
-        print(f"    Micro F1: {clinical_14['Clinical_Micro_F1']:.4f}")
+            print(f"\n    F1=0 (need attention): {', '.join(zero_f1)}")
 
     # --- Diversity ---
     print(f"\n  [Diversity]  (weight = {WEIGHT_DIVERSITY})")
@@ -511,15 +460,14 @@ def evaluate(preds, refs, gt_labels_path=None, no_clinical=False):
     print(f"    Duplicate Ratio: {diversity['duplicate_ratio']:.4f}")
     print(f"    Mean Length:     {diversity['mean_len']:.1f} words")
     if diversity["most_common"]:
-        print(f"    Most Common:     {diversity['most_common'][0][1]}× dup")
+        print(f"    Most Common:     {diversity['most_common'][0][1]}x dup")
 
     # --- Composite ---
-    if clinical_37 is not None:
-        composite = compute_composite(nlg, clinical_37, diversity)
+    if clinical is not None:
+        composite = compute_composite(nlg, clinical, diversity)
         print(f"\n  {'='*70}")
         print(f"  [Composite Score]")
-        formula = f"{WEIGHT_NLG} * {nlg_avg:.4f} + {WEIGHT_CLINICAL} * {clinical_37['Clinical_Macro_F1']:.4f} + {WEIGHT_DIVERSITY} * {diversity['uniqueness']:.4f}"
-        print(f"  = {formula}")
+        print(f"  {WEIGHT_NLG} * {nlg_avg:.4f} + {WEIGHT_CLINICAL} * {clinical['Clinical_Macro_F1']:.4f} + {WEIGHT_DIVERSITY} * {diversity['uniqueness']:.4f}")
         print(f"  = {composite:.4f}")
         print(f"  {'='*70}")
     else:
@@ -528,8 +476,7 @@ def evaluate(preds, refs, gt_labels_path=None, no_clinical=False):
     return {
         "num_samples": len(pred_reports),
         "nlg": nlg,
-        "clinical_37": clinical_37,
-        "clinical_14": clinical_14 if not no_clinical else None,
+        "clinical": clinical,
         "diversity": diversity,
         "composite_score": composite,
     }
@@ -542,7 +489,7 @@ def compare_versions(results_list):
     print(f"\n{'=' * 70}")
     print(f"  Version Comparison")
     print(f"{'=' * 70}")
-    header = f"{'Version':30s} | {'BLEU-4':>7s} | {'METEOR':>7s} | {'ROUGE-L':>7s} | {'C37-Macro':>9s} | {'C14-Macro':>9s} | {'Uniq':>6s} | {'Score':>8s}"
+    header = f"{'Version':30s} | {'BLEU-4':>7s} | {'METEOR':>7s} | {'ROUGE-L':>7s} | {'C-Macro':>9s} | {'Uniq':>6s} | {'Score':>8s}"
     print(header)
     print("-" * len(header))
 
@@ -550,14 +497,12 @@ def compare_versions(results_list):
     for r in results_list:
         name = r.get("name", "unknown")[-30:]
         nlg = r["nlg"]
-        c37 = r.get("clinical_37") or {}
-        c14 = r.get("clinical_14") or {}
+        clinical = r.get("clinical") or {}
         div = r["diversity"]
         cs = r.get("composite_score") or 0
 
         print(f"{name:30s} | {nlg['BLEU-4']:7.4f} | {nlg['METEOR']:7.4f} "
-              f"| {nlg['ROUGE-L']:7.4f} | {c37.get('Clinical_Macro_F1', -1):9.4f} "
-              f"| {c14.get('Clinical_Macro_F1', -1):9.4f} "
+              f"| {nlg['ROUGE-L']:7.4f} | {clinical.get('Clinical_Macro_F1', -1):9.4f} "
               f"| {div['uniqueness']:5.1%} | {cs:8.4f}")
 
         if cs > best["composite_score"]:
