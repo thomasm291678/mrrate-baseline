@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.venv/
+.trae/
+.monitor_v5_state.json
+*.pt
+*.pth
+.env
+*.log

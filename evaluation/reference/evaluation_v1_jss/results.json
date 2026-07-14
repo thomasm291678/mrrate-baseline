@@ -1,0 +1,13 @@
+{
+  "nlg": {
+    "BLEU-4": 1.0,
+    "METEOR": 0.9999997092678988,
+    "ROUGE-L": 1.0
+  },
+  "clinical": {
+    "Clinical_Macro_F1": 0.6216216216216216,
+    "Clinical_Micro_F1": 1.0
+  },
+  "diversity": 1.0,
+  "composite": 0.8486486098843686
+}
