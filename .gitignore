@@ -12,11 +12,13 @@ monitor_state.json
 *.out
 dashboard.html
 
+# intermediate data (not version controlled)
+outputs/
+checkpoints/
+weights/
+training_logs/
+
 # research submodules (not ours)
 research_awesome/
 research_m3d/
 HuatuoGPT/
-
-# temp scripts (organized into folders)
-scripts/
-outputs/
