@@ -21,19 +21,20 @@ APPROX_DISEASE_FREQ = [
 
 def alignment_loss_fn(vt, text_embeds, enc, freq_weights, pad_mask):
     """
-    Symmetric disease-aware alignment via shared cross-attention.
-
-    Visual: [B, 120, 2048] → DiseaseAwareProjector → [B, 37, 2048]
-    Text:   [B, T, 2048]  → DiseaseAwareProjector → [B, 37, 2048]
-    Loss:   per-disease MSE weighted by inverse frequency.
+    Visual side: 37 disease-aware tokens from cross-attention (enc.disease_proj).
+    Text side:   mean-pool Qwen embeddings  → broadcast to 37.
+    Loss:        weighted MSE between visual tokens and pooled text embedding.
     """
     te = text_embeds.float()
     if te.shape[1] == 0:
         return torch.tensor(0.0, device=vt.device, requires_grad=True)
 
-    te_37 = enc.disease_proj(te, key_padding_mask=pad_mask)
-    w = freq_weights.to(vt.device).float().view(1, 37, 1)
-    se = (vt.float() - te_37).pow(2)
+    mask = (~pad_mask).float().unsqueeze(-1)
+    te_pooled = (te * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1)
+    te_pooled = te_pooled.unsqueeze(1).expand(-1, vt.shape[1], -1)
+
+    w = freq_weights.to(vt.device).float().view(1, vt.shape[1], 1)
+    se = (vt.float() - te_pooled).pow(2)
     return (se * w).sum() / se.numel()
 
 
