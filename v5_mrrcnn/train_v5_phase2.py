@@ -35,7 +35,7 @@ def alignment_loss_fn(vt, text_embeds, enc, freq_weights, pad_mask):
 
     w = freq_weights.to(vt.device).float().view(1, vt.shape[1], 1)
     se = (vt.float() - te_pooled).pow(2)
-    return (se * w).sum() / se.numel()
+    return (se * w).sum() / (vt.shape[0] * vt.shape[2])
 
 
 def collate_fn(batch):
@@ -118,8 +118,8 @@ def train(args):
 
     enc = ReportingModelV5(
         llm_dim=args.llm_dim, grid=G, base_ch=args.base_ch,
-        n_vt_out=1).to(dev)
-    log(f"Visual token output: {enc.n_tokens_out} (37 disease-aware tokens)")
+    ).to(dev)
+    log(f"Visual token output: {enc.n_tokens_out} (120 CNN tokens)")
 
     if args.encoder_ckpt:
         log("Loading Phase 1 encoder weights...")

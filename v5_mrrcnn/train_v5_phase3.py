@@ -1,17 +1,6 @@
-"""
-Phase 3: Qwen LoRA Report Generation — aggressively optimized.
-Magic numbers summary:
-  batch_size = 8   — GPU has 97GB, 36GB unused; 4× fewer steps per epoch
-  lora_r = 8   — 3B model info bottleneck is vocabulary, not rank; half the params = 2× opt speed
-  num_workers = 8, prefetch_factor = 4   — saturate NAS I/O
-  fused AdamW + set_to_none   — merge 3 kernels into 1
-  torch.compile(frozen_encoder)   — CUDA graph replay on every forward
-  ga_steps = 1   — single accumulation = fewer kernel launches
-"""
 import argparse, sys, time, signal
 from pathlib import Path
 import torch, torch.nn as nn
-import torch.nn.functional as F
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from encoder_v5 import ReportingModelV5, apply_optimizations
@@ -22,9 +11,9 @@ apply_optimizations()
 IGNORE_INDEX = -100
 
 
-def build_embeddings(llm, tok, vt_float, target_ids, B, n_vt, device):
+def build_embeddings(llm, tok, vt, target_ids, B, n_vt, device):
     text_embeds = llm.get_input_embeddings()(target_ids)
-    combined = torch.cat([vt_float.to(text_embeds.dtype), text_embeds], dim=1)
+    combined = torch.cat([vt.to(text_embeds.dtype), text_embeds], dim=1)
     ignore_labels = torch.full((B, n_vt), IGNORE_INDEX, dtype=target_ids.dtype, device=device)
     labels = torch.cat([ignore_labels, target_ids], dim=1)
     attn_mask = torch.cat([
@@ -38,20 +27,12 @@ def collate_fn(batch):
     h1_list, hf_list, h2_list = [], [], []
     reports_list = []
     for b in batch:
-        t1_list.append(b["t1"])
-        flair_list.append(b["flair"])
-        t2_list.append(b["t2"])
-        h1_list.append(b["has_t1"])
-        hf_list.append(b["has_flair"])
-        h2_list.append(b["has_t2"])
+        t1_list.append(b["t1"]); flair_list.append(b["flair"]); t2_list.append(b["t2"])
+        h1_list.append(b["has_t1"]); hf_list.append(b["has_flair"]); h2_list.append(b["has_t2"])
         reports_list.append(b["report"])
     return {
-        "t1": torch.stack(t1_list),
-        "flair": torch.stack(flair_list),
-        "t2": torch.stack(t2_list),
-        "has_t1": torch.stack(h1_list),
-        "has_flair": torch.stack(hf_list),
-        "has_t2": torch.stack(h2_list),
+        "t1": torch.stack(t1_list), "flair": torch.stack(flair_list), "t2": torch.stack(t2_list),
+        "has_t1": torch.stack(h1_list), "has_flair": torch.stack(hf_list), "has_t2": torch.stack(h2_list),
         "reports": reports_list,
     }
 
@@ -63,9 +44,7 @@ def save_checkpoint(enc, llm, opt, sched, scaler, epoch, global_step, best_loss,
         "optimizer_state": opt.state_dict(),
         "scheduler_state": sched.state_dict() if sched else {},
         "scaler_state": scaler.state_dict() if scaler else None,
-        "epoch": epoch,
-        "global_step": global_step,
-        "best_loss": best_loss,
+        "epoch": epoch, "global_step": global_step, "best_loss": best_loss,
     }
     torch.save(state, path)
 
@@ -78,7 +57,7 @@ def load_checkpoint(path, enc, llm, opt, sched, scaler, dev):
     try:
         opt.load_state_dict(ckpt["optimizer_state"])
     except ValueError:
-        print(f"  [WARN] Skipping optimizer state (param group mismatch)")
+        print("  [WARN] Skipping optimizer state (param group mismatch)")
     if sched and ckpt.get("scheduler_state"):
         sched.load_state_dict(ckpt["scheduler_state"])
     if scaler and ckpt.get("scaler_state"):
@@ -100,27 +79,25 @@ def train(args):
         print(line, flush=True)
         log_f.write(line + "\n")
 
-    log(f"Phase 3: Qwen LoRA Report Generation (optimized)")
+    log("Phase 3: Qwen LoRA Report Generation")
     log(f"Log: {log_path}")
     log(f"Encoder checkpoint: {args.encoder_ckpt}")
 
     from transformers import AutoModelForCausalLM, AutoTokenizer
     from peft import LoraConfig, get_peft_model
 
-    G = args.grid
-    enc = ReportingModelV5(llm_dim=args.llm_dim, grid=G, base_ch=args.base_ch, n_vt_out=args.n_vt_out).to(dev)
+    enc = ReportingModelV5(llm_dim=2048, grid=2, base_ch=32).to(dev)
     n_vt = enc.n_tokens_out
-    log(f"Visual tokens: {n_vt}")
+    log(f"Visual tokens: {n_vt} (120 CNN tokens from MRRCNN, no projector)")
 
-    if args.encoder_ckpt:
-        log(f"Loading Phase 2 encoder weights...")
-        phase2 = torch.load(args.encoder_ckpt, map_location=dev, weights_only=False)
-        enc.load_state_dict(phase2["encoder_state"], strict=False)
-        log(f"  Loaded Phase 2 encoder (epoch {phase2.get('epoch','?')}, step {phase2.get('global_step','?')})")
+    # Load Phase 1 encoder weights (Phase 1 done contrastive pretraining)
+    ck = torch.load(args.encoder_ckpt, map_location=dev, weights_only=False)
+    enc.load_state_dict(ck["encoder_state"], strict=False)
+    log(f"  Loaded encoder (epoch {ck.get('epoch','?')}, step {ck.get('global_step','?')})")
 
     for p in enc.parameters():
         p.requires_grad = False
-    log("Froze entire V5 encoder + projector")
+    log("Froze entire V5 encoder")
 
     tok = AutoTokenizer.from_pretrained(args.qwen_path, local_files_only=True, trust_remote_code=True)
     if tok.pad_token is None:
@@ -134,9 +111,6 @@ def train(args):
         llm.gradient_checkpointing_enable()
         llm.config.use_cache = False
 
-    # Magic: lora_r=8 is the sweet spot for 3B models.
-    # Rank 8 vs 16: 50% fewer params, 2× faster optimizer step,
-    # <0.5% quality loss (info bottleneck is vocabulary size, not adapter rank).
     lora_cfg = LoraConfig(
         r=args.lora_r, lora_alpha=args.lora_alpha, lora_dropout=args.lora_drop,
         target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
@@ -158,13 +132,8 @@ def train(args):
     signal.signal(signal.SIGSEGV, lambda *a: (sys.exit(0)))
 
     train_ds = MRRateDataset(args.data_root, "train", augment=False, batch_filter=args.batch_id)
-    val_ds = MRRateDataset(args.data_root, "val", augment=False, batch_filter=args.batch_id)
-    log(f"Train: {len(train_ds)}  Val: {len(val_ds)}  Batch: {args.batch_size}  Workers: {args.num_workers}")
+    log(f"Train: {len(train_ds)}  Batch: {args.batch_size}  Workers: {args.num_workers}")
 
-    # Magic numbers:
-    # num_workers=8 : 16 physical cores, 8 workers leaves headroom for tokenizer + CUDA driver
-    # prefetch_factor=4 : 4 batches pre-loaded, hides NAS seek latency (~1ms per file)
-    # persistent_workers=True : avoids O(5s) fork overhead each epoch
     loader = torch.utils.data.DataLoader(
         train_ds, batch_size=args.batch_size, shuffle=True,
         num_workers=args.num_workers, collate_fn=collate_fn,
@@ -196,6 +165,7 @@ def train(args):
         enc.eval()
         llm.train()
         epoch_loss = 0.0
+        epoch_steps = 0
         ga_count = 0
         opt.zero_grad(set_to_none=True)
 
@@ -222,7 +192,8 @@ def train(args):
                     loss = llm(inputs_embeds=embeds, attention_mask=am, labels=labels).loss / args.ga_steps
                     loss.backward()
 
-                epoch_loss += loss.item()
+                epoch_loss += loss.item() * args.ga_steps
+                epoch_steps += 1
                 ga_count += 1
 
                 if ga_count % args.ga_steps == 0:
@@ -245,19 +216,14 @@ def train(args):
                         elapsed = time.time() - t0
                         eta_s = (total_steps - n_steps) * elapsed / max(n_steps, 1)
                         mem = torch.cuda.max_memory_allocated() / 1e9 if torch.cuda.is_available() else 0
+                        avg_l = epoch_loss / max(1, epoch_steps)
                         log(f"[E{epoch:03d} {n_steps/total_steps*100:5.1f}% S{n_steps:05d}] "
-                            f"loss={loss.item()*args.ga_steps:.4f} avg_loss={epoch_loss/max(1,step+1):.4f} "
+                            f"loss={loss.item()*args.ga_steps:.4f} avg_loss={avg_l:.4f} "
                             f"lr={opt.param_groups[0]['lr']:.1e} mem={mem:.1f}GB eta={eta_s/3600:.1f}h")
-
-                    if global_step % args.auto_save_interval == 0:
-                        save_checkpoint(enc, llm, opt, sched, scaler, epoch, global_step,
-                                        best_loss, log_dir / "phase3_latest.pt")
-                        log_f.flush()
 
                     if global_step % args.save_interval == 0:
                         save_checkpoint(enc, llm, opt, sched, scaler, epoch, global_step,
-                                        best_loss,
-                                        log_dir / f"phase3_step{global_step}.pt")
+                                        best_loss, log_dir / f"phase3_step{global_step}.pt")
                         log(f"Saved: step {global_step}")
 
             except Exception as e:
@@ -280,7 +246,14 @@ def train(args):
                 opt.step()
             opt.zero_grad(set_to_none=True)
 
-        log(f"Epoch {epoch} done. avg_loss: {epoch_loss/max(1,step+1):.4f}")
+        avg_loss = epoch_loss / max(1, epoch_steps)
+        log(f"Epoch {epoch} done. avg_loss: {avg_loss:.4f}")
+
+        if avg_loss < best_loss:
+            best_loss = avg_loss
+            save_checkpoint(enc, llm, opt, sched, scaler, epoch, global_step,
+                            best_loss, log_dir / "phase3_best.pt")
+            log(f"  New best loss: {best_loss:.4f}")
 
     log("Phase 3 finished.")
     log_f.flush()
@@ -293,19 +266,15 @@ def main():
     p.add_argument("--data_root", type=str, default="/mnt/nas1/disk07/public/mr_data/MR-RATE")
     p.add_argument("--qwen_path", type=str, default="/mnt/nas1/disk07/public/model_weights/Qwen2.5-3B-Instruct")
     p.add_argument("--log_dir", type=str, default="outputs/report_gen")
-    p.add_argument("--grid", type=int, default=2)
-    p.add_argument("--base_ch", type=int, default=32)
-    p.add_argument("--llm_dim", type=int, default=2048)
-    p.add_argument("--n_vt_out", type=int, default=None, help="visual token count (None=120, else uses cross-attn projector)")
-    p.add_argument("--batch_size", type=int, default=8)  # magic:   shows 36/97GB idle
+    p.add_argument("--batch_size", type=int, default=8)
     p.add_argument("--ga_steps", type=int, default=1)
     p.add_argument("--epochs", type=int, default=3)
-    p.add_argument("--num_workers", type=int, default=8)  # magic: 16-core sweet spot
-    p.add_argument("--prefetch_factor", type=int, default=4)  # magic: 4x pipeline depth
+    p.add_argument("--num_workers", type=int, default=8)
+    p.add_argument("--prefetch_factor", type=int, default=4)
     p.add_argument("--lr", type=float, default=5e-5)
     p.add_argument("--wd", type=float, default=0.01)
     p.add_argument("--grad_clip", type=float, default=1.0)
-    p.add_argument("--lora_r", type=int, default=8)  # magic: half the params, >99% quality
+    p.add_argument("--lora_r", type=int, default=8)
     p.add_argument("--lora_alpha", type=int, default=16)
     p.add_argument("--lora_drop", type=float, default=0.05)
     p.add_argument("--max_text_len", type=int, default=512)
@@ -314,7 +283,6 @@ def main():
     p.add_argument("--auto_resume", action="store_true")
     p.add_argument("--log_interval", type=int, default=5)
     p.add_argument("--save_interval", type=int, default=500)
-    p.add_argument("--auto_save_interval", type=int, default=50)
     p.add_argument("--batch_id", type=str, default=None)
     args = p.parse_args()
     train(args)

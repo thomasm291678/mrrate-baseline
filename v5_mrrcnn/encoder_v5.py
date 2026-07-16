@@ -116,27 +116,6 @@ class MRRCNN(nn.Module):
         return self.stage_attn(cat_tokens)
 
 
-class DiseaseAwareProjector(nn.Module):
-    """37 disease queries cross-attend to visual/text tokens for per-disease alignment.
-
-    Shared learnable query vectors Q ∈ R^{37×2048} are used symmetrically on both
-    visual (120 CNN tokens) and text (variable-length embeddings) sides via MHA.
-    Each of the 37 output tokens corresponds to one clinical dimension.
-    """
-    def __init__(self, n_diseases=37, llm_dim=2048, n_heads=8):
-        super().__init__()
-        self.n_diseases = n_diseases
-        self.queries = nn.Parameter(torch.randn(1, n_diseases, llm_dim) * 0.02)
-        self.cross_attn = nn.MultiheadAttention(llm_dim, n_heads, bias=False, batch_first=True)
-        self.norm = nn.LayerNorm(llm_dim)
-
-    def forward(self, x, key_padding_mask=None):
-        B = x.shape[0]
-        q = self.queries.expand(B, -1, -1).to(x.dtype)
-        out, _ = self.cross_attn(q, x, x, key_padding_mask=key_padding_mask)
-        return self.norm(out + q)
-
-
 class ContrastiveHead(nn.Module):
     def __init__(self, cnn_dim=512, proj_dim=256):
         super().__init__()
@@ -155,7 +134,7 @@ class ContrastiveHead(nn.Module):
 
 
 class ReportingModelV5(nn.Module):
-    def __init__(self, llm_dim=2048, grid=2, base_ch=32, proj_dim=256, n_vt_out=None):
+    def __init__(self, llm_dim=2048, grid=2, base_ch=32, proj_dim=256):
         super().__init__()
         self.n_tokens_per_mod = 5 * (grid ** 3)
         self.total_tokens = 3 * self.n_tokens_per_mod
@@ -174,8 +153,7 @@ class ReportingModelV5(nn.Module):
 
         self.mod_emb = nn.Parameter(torch.randn(3, 1, llm_dim) * 0.02)
 
-        self.disease_proj = DiseaseAwareProjector(llm_dim=llm_dim) if n_vt_out else None
-        self.n_tokens_out = 37 if n_vt_out else self.total_tokens
+        self.n_tokens_out = self.total_tokens
 
     def _encode(self, enc, proj, vol, present, mod_id, B, dev):
         if not present.any():
@@ -198,8 +176,6 @@ class ReportingModelV5(nn.Module):
         v2 = self._encode(self.t2_enc, self.t2_proj, t2, has_t2, 1, B, dev)
         v3 = self._encode(self.flair_enc, self.flair_proj, flair, has_flair, 2, B, dev)
         vt = torch.cat([v1, v2, v3], dim=1)
-        if self.disease_proj is not None:
-            vt = self.disease_proj(vt)
         return vt
 
 
