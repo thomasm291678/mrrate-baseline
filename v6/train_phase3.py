@@ -3,7 +3,7 @@ from pathlib import Path
 import torch, torch.nn as nn
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from encoder_v5 import ReportingModelV5, apply_optimizations
+from model import MultiModalEncoder, apply_optimizations
 from mrrate_dataset import MRRateDataset
 
 apply_optimizations()
@@ -70,7 +70,7 @@ def train(args):
     log_dir = Path(args.log_dir)
     log_dir.mkdir(parents=True, exist_ok=True)
     ts = time.strftime("%Y%m%d_%H%M%S")
-    log_path = log_dir / f"train_phase3_qwen_{ts}.log"
+    log_path = log_dir / f"train_phase3_{ts}.log"
     log_f = open(log_path, "a", buffering=1)
 
     def log(msg):
@@ -86,18 +86,21 @@ def train(args):
     from transformers import AutoModelForCausalLM, AutoTokenizer
     from peft import LoraConfig, get_peft_model
 
-    enc = ReportingModelV5(llm_dim=2048, grid=2, base_ch=32).to(dev)
-    n_vt = enc.n_tokens_out
-    log(f"Visual tokens: {n_vt} (120 CNN tokens from MRRCNN, no projector)")
+    enc = MultiModalEncoder(llm_dim=2048, grid=2, base_ch=32).to(dev)
+    n_vt = enc.total_tokens
+    log(f"Visual tokens: {n_vt} (120 raw CNN tokens)")
 
-    # Load Phase 1 encoder weights (Phase 1 done contrastive pretraining)
     ck = torch.load(args.encoder_ckpt, map_location=dev, weights_only=False)
-    enc.load_state_dict(ck["encoder_state"], strict=False)
-    log(f"  Loaded encoder (epoch {ck.get('epoch','?')}, step {ck.get('global_step','?')})")
+    missing, unexpected = enc.load_state_dict(ck["encoder_state"], strict=False)
+    log(f"  Loaded Phase 1 encoder (epoch {ck.get('epoch','?')}, step {ck.get('global_step','?')})")
+    if missing:
+        log(f"  Missing keys: {len(missing)}")
+    if unexpected:
+        log(f"  Unexpected keys: {len(unexpected)}")
 
     for p in enc.parameters():
         p.requires_grad = False
-    log("Froze entire V5 encoder")
+    log("Froze encoder")
 
     tok = AutoTokenizer.from_pretrained(args.qwen_path, local_files_only=True, trust_remote_code=True)
     if tok.pad_token is None:
@@ -120,10 +123,10 @@ def train(args):
     log(f"Qwen LoRA (r={args.lora_r}): {lora_params:,} params")
 
     total_enc = sum(p.numel() for p in enc.parameters())
-    log(f"Encoder params: {total_enc:,} (all frozen)")
+    log(f"Encoder params: {total_enc:,} (frozen)")
 
     trainable = [p for p in llm.parameters() if p.requires_grad]
-    log(f"Total trainable: {sum(p.numel() for p in trainable):,}")
+    log(f"Trainable: {sum(p.numel() for p in trainable):,}")
 
     opt = torch.optim.AdamW(trainable, lr=args.lr, weight_decay=args.wd)
     scaler = torch.amp.GradScaler("cuda") if args.use_amp else None

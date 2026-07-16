@@ -4,11 +4,9 @@ import torch, torch.nn as nn
 import torch.nn.functional as F
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from encoder_v5 import ReportingModelV5, apply_optimizations
+from model import MultiModalEncoder, apply_optimizations
 from mrrate_dataset import MRRateDataset
 
-# Magic: matmul precision decides float32 vs tf32 for all einsum/matmul,
-# high = tf32 where safe, almost 2× speed with near-zero accuracy loss
 apply_optimizations()
 
 
@@ -55,8 +53,7 @@ def forward_contrastive(enc, batch, dev):
 def collate_fn(batch):
     t1_list, flair_list, t2_list = [], [], []
     h1_list, hf_list, h2_list = [], [], []
-    reports_list = []
-    pid_strs = []
+    reports_list, pid_strs = [], []
     for b in batch:
         t1_list.append(b["t1"])
         flair_list.append(b["flair"])
@@ -109,7 +106,7 @@ def train(args):
     log_dir = Path(args.log_dir)
     log_dir.mkdir(parents=True, exist_ok=True)
     ts = time.strftime("%Y%m%d_%H%M%S")
-    log_path = log_dir / f"train_phase1_encoder_{ts}.log"
+    log_path = log_dir / f"train_phase1_{ts}.log"
     log_f = open(log_path, "a", buffering=1)
 
     def log(msg):
@@ -118,32 +115,29 @@ def train(args):
         print(line, flush=True)
         log_f.write(line + "\n")
 
-    log(f"Phase 1: Encoder Contrastive Learning")
+    log(f"Phase 1: Contrastive Learning")
     log(f"Log: {log_path}")
     log(f"Grid: {args.grid}  BaseCh: {args.base_ch}  BatchID: {args.batch_id}")
 
     G = args.grid
     n_tokens_per_mod = 5 * (G ** 3)
 
-    enc = ReportingModelV5(llm_dim=args.llm_dim, grid=G, base_ch=args.base_ch).to(dev)
+    enc = MultiModalEncoder(llm_dim=2048, grid=G, base_ch=args.base_ch).to(dev)
     for key in ["t1_proj", "t2_proj", "flair_proj"]:
         for p in getattr(enc, key).parameters():
             p.requires_grad = False
 
     total = sum(p.numel() for p in enc.parameters())
     trainable = sum(p.numel() for p in enc.parameters() if p.requires_grad)
-    log(f"Encoder params: {total:,}  Trainable: {trainable:,}")
+    log(f"Params: {total:,} total  {trainable:,} trainable")
     log(f"Tokens per modality: {n_tokens_per_mod}")
 
-    # torch.compile the encoder with reduce-overhead (CUDA graph replay for frozen parts)
     try:
         enc = torch.compile(enc, mode="reduce-overhead", dynamic=False)
-        log("Encoder compiled (reduce-overhead mode)")
+        log("Encoder compiled (reduce-overhead)")
     except Exception as e:
         log(f"torch.compile skipped: {e}")
 
-    # Fused AdamW: foreach=True for vectorized step, fused=True merges compute into 1 kernel
-    # Magic: fused requires CUDA 12+ toolkit, falls back gracefully if unavailable
     opt = torch.optim.AdamW(
         [p for p in enc.parameters() if p.requires_grad],
         lr=args.lr, weight_decay=args.wd)
@@ -152,10 +146,8 @@ def train(args):
     signal.signal(signal.SIGSEGV, lambda *a: (sys.exit(0)))
 
     train_ds = MRRateDataset(args.data_root, "train", augment=args.augment, batch_filter=args.batch_id)
-    val_ds = MRRateDataset(args.data_root, "val", augment=False, batch_filter=args.batch_id)
-    log(f"Train: {len(train_ds)}  Val: {len(val_ds)}  Batch: {args.batch_size}  Workers: {args.num_workers}")
+    log(f"Train: {len(train_ds)}  Batch: {args.batch_size}  Workers: {args.num_workers}")
 
-    # Magic numbers: 8 workers + prefetch_factor=4 saturate NAS I/O on 16-core machines
     loader = torch.utils.data.DataLoader(
         train_ds, batch_size=args.batch_size, shuffle=True,
         num_workers=args.num_workers, collate_fn=collate_fn,
@@ -168,7 +160,7 @@ def train(args):
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(
         opt, T_max=total_steps + 10, eta_min=args.lr * 0.01,
     )
-    log(f"Total opt steps: {total_steps}  LR: {args.lr}  Fused AdamW: yes")
+    log(f"Total opt steps: {total_steps}  LR: {args.lr}")
 
     start_epoch, global_step, best_loss = 1, 0, float("inf")
 
@@ -216,16 +208,15 @@ def train(args):
                             f"loss={loss.item()*args.ga_steps:.4f} avg_loss={epoch_loss/max(1,step+1):.4f} "
                             f"lr={opt.param_groups[0]['lr']:.1e} mem={mem:.1f}GB eta={eta_s/3600:.1f}h")
 
+                    if global_step % args.save_interval == 0:
+                        save_checkpoint(enc, opt, sched, epoch, global_step,
+                                        best_loss, log_dir / f"phase1_step{global_step}.pt")
+                        log(f"Saved: step {global_step}")
+
                     if global_step % args.auto_save_interval == 0:
                         save_checkpoint(enc, opt, sched, epoch, global_step,
                                         best_loss, log_dir / "phase1_latest.pt")
                         log_f.flush()
-
-                    if global_step % args.save_interval == 0:
-                        save_checkpoint(enc, opt, sched, epoch, global_step,
-                                        best_loss,
-                                        log_dir / f"phase1_step{global_step}.pt")
-                        log(f"Saved: step {global_step}")
 
             except Exception as e:
                 log(f"ERROR at step {step}: {e}")
@@ -241,7 +232,14 @@ def train(args):
             opt.step()
             opt.zero_grad(set_to_none=True)
 
-        log(f"Epoch {epoch} done. avg_loss: {epoch_loss/max(1,step+1):.4f}")
+        avg_loss = epoch_loss / max(1, step + 1)
+        log(f"Epoch {epoch} done. avg_loss: {avg_loss:.4f}")
+
+        if avg_loss < best_loss:
+            best_loss = avg_loss
+            save_checkpoint(enc, opt, sched, epoch, global_step,
+                            best_loss, log_dir / "phase1_best.pt")
+            log(f"  New best loss: {best_loss:.4f}")
 
     log("Phase 1 finished.")
     log_f.flush()
@@ -249,17 +247,16 @@ def train(args):
 
 
 def main():
-    p = argparse.ArgumentParser("Phase 1: Encoder Contrastive Learning")
+    p = argparse.ArgumentParser("Phase 1: Contrastive Learning")
     p.add_argument("--data_root", type=str, default="/mnt/nas1/disk07/public/mr_data/MR-RATE")
     p.add_argument("--log_dir", type=str, default="outputs/report_gen")
     p.add_argument("--grid", type=int, default=2)
     p.add_argument("--base_ch", type=int, default=32)
-    p.add_argument("--llm_dim", type=int, default=2048)
     p.add_argument("--batch_size", type=int, default=16)
     p.add_argument("--ga_steps", type=int, default=1)
     p.add_argument("--epochs", type=int, default=5)
-    p.add_argument("--num_workers", type=int, default=8)  # magic: 16-core sweet spot
-    p.add_argument("--prefetch_factor", type=int, default=4)  # magic: 4x pipeline depth
+    p.add_argument("--num_workers", type=int, default=8)
+    p.add_argument("--prefetch_factor", type=int, default=4)
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--wd", type=float, default=1e-4)
     p.add_argument("--grad_clip", type=float, default=1.0)
