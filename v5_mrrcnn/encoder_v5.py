@@ -130,14 +130,14 @@ class DiseaseAwareProjector(nn.Module):
         self.cross_attn = nn.MultiheadAttention(llm_dim, n_heads, bias=False, batch_first=True)
         self.norm = nn.LayerNorm(llm_dim)
 
-    def forward(self, x):
+    def forward(self, x, key_padding_mask=None):
         B = x.shape[0]
         q = self.queries.expand(B, -1, -1).to(x.dtype)
-        out, _ = self.cross_attn(q, x, x)
+        out, _ = self.cross_attn(q, x, x, key_padding_mask=key_padding_mask)
         return self.norm(out + q)
 
 
-class ContrasiveHead(nn.Module):
+class ContrastiveHead(nn.Module):
     def __init__(self, cnn_dim=512, proj_dim=256):
         super().__init__()
         self.mlp = nn.Sequential(
@@ -152,8 +152,6 @@ class ContrasiveHead(nn.Module):
         return nn.functional.normalize(self.mlp(pooled), dim=1)
 
 
-def _frozen_nonzero_any(mask):
-    return mask.any()
 
 
 class ReportingModelV5(nn.Module):
@@ -168,7 +166,7 @@ class ReportingModelV5(nn.Module):
         self.t2_enc = MRRCNN(in_chans=1, base_ch=base_ch, grid=grid)
         self.flair_enc = MRRCNN(in_chans=1, base_ch=base_ch, grid=grid)
 
-        self.contra_head = ContrasiveHead(cnn_dim=self.cnn_dim, proj_dim=proj_dim)
+        self.contra_head = ContrastiveHead(cnn_dim=self.cnn_dim, proj_dim=proj_dim)
 
         self.t1_proj = nn.Linear(self.cnn_dim, llm_dim)
         self.t2_proj = nn.Linear(self.cnn_dim, llm_dim)
@@ -205,12 +203,6 @@ class ReportingModelV5(nn.Module):
         return vt
 
 
-OPT_CUDA_KWARGS_MRATE = {
-    "torch.set_float32_matmul_precision": "high",
-    "torch.backends.cudnn.benchmark": True,
-    "torch.backends.cuda.matmul.allow_tf32": True,
-    "torch.backends.cudnn.allow_tf32": True,
-}
 
 
 def apply_optimizations():

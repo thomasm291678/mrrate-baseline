@@ -1,83 +1,97 @@
 import paramiko
 import time
 
-host = "10.176.60.70"
-user = "jiaqigu"
-password = "lijia7272"
+HOST = "10.176.60.70"
+USER = "jiaqigu"
+PASSWORD = "lijia7272"
 
-client = paramiko.SSHClient()
-client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+def ssh_exec(ssh, cmd):
+    stdin, stdout, stderr = ssh.exec_command(cmd, timeout=15)
+    out = stdout.read().decode("utf-8", errors="replace").strip()
+    err = stderr.read().decode("utf-8", errors="replace").strip()
+    return out, err
+
+print("=" * 70)
+print("  Farm02 (10.176.60.70) 4-GPU Phase 1 训练状态检查")
+print("=" * 70)
+
+ssh = paramiko.SSHClient()
+ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
 try:
-    client.connect(host, username=user, password=password, timeout=15)
-    print(f"=== 已连接到 {host} ===\n")
+    ssh.connect(HOST, username=USER, password=PASSWORD, timeout=15)
+    print("[OK] SSH 连接成功\n")
 
-    # 检查 train_v5 进程是否还在运行
-    stdin, stdout, stderr = client.exec_command("ps aux | grep train_v5 | grep -v grep")
-    train_procs = stdout.read().decode().strip()
-    all_done = not bool(train_procs)
+    # 1. Check training progress for each GPU
+    print("-" * 70)
+    print("  Phase 1 对比学习训练进度")
+    print("-" * 70)
 
-    print("=" * 70)
-    print("Phase 1 对比学习训练状态 - 4 GPU 并行")
-    print("=" * 70)
-
+    all_done = True
     for gpu_id in range(4):
         session = f"gpu{gpu_id}"
-        cmd = f"tmux capture-pane -t {session} -p | grep -E 'loss=|E00' | tail -1"
-        stdin, stdout, stderr = client.exec_command(cmd)
-        output = stdout.read().decode().strip()
-        err = stderr.read().decode().strip()
+        cmd = f"tmux capture-pane -t {session} -p | grep -E 'loss=|E0' | tail -1"
+        out, err = ssh_exec(ssh, cmd)
 
         if err:
-            print(f"\n[GPU {gpu_id}] tmux session '{session}' 错误: {err}")
-        elif output:
-            print(f"\n[GPU {gpu_id}] 最新训练日志: {output}")
+            print(f"  GPU {gpu_id} ({session}): [ERROR] {err}")
+            all_done = False
+        elif out:
+            print(f"  GPU {gpu_id} ({session}): {out}")
+            all_done = False
         else:
-            print(f"\n[GPU {gpu_id}] tmux session '{session}' 无 loss/E00 输出")
+            print(f"  GPU {gpu_id} ({session}): 无输出 (session 可能已完成或不存在)")
+            # Check if session exists
+            check_cmd = f"tmux has-session -t {session} 2>&1"
+            check_out, _ = ssh_exec(ssh, check_cmd)
+            if check_out:
+                print(f"    -> session 不存在，任务可能已完成")
 
-    print("\n" + "=" * 70)
-    print("GPU 利用率 (nvidia-smi)")
+    # 2. Check if train_v5 process is still running
+    print(f"\n{'-' * 70}")
+    print("  train_v5 进程状态")
+    print("-" * 70)
+    proc_out, _ = ssh_exec(ssh, "ps aux | grep -v grep | grep train_v5")
+    if proc_out:
+        print(proc_out)
+        all_done = False
+    else:
+        print("  无 train_v5 进程运行")
+
+        # If all done, get finish time via tmux history
+        print(f"\n{'-' * 70}")
+        print("  训练完成时间 (查看 tmux 最近输出)")
+        print("-" * 70)
+        for gpu_id in range(4):
+            session = f"gpu{gpu_id}"
+            cmd = f"tmux capture-pane -t {session} -p -S -500 | tail -20"
+            out, err = ssh_exec(ssh, cmd)
+            if out:
+                print(f"\n  GPU {gpu_id} ({session}) 末尾输出:")
+                print("  " + out.replace("\n", "\n  "))
+            else:
+                print(f"  GPU {gpu_id} ({session}): 无数据或 session 不存在")
+
+    # 3. nvidia-smi GPU utilization
+    print(f"\n{'-' * 70}")
+    print("  GPU 利用率 (nvidia-smi)")
+    print("-" * 70)
+    smi_out, _ = ssh_exec(ssh, "nvidia-smi --query-gpu=index,name,utilization.gpu,memory.used,memory.total,temperature.gpu --format=csv,noheader")
+    if smi_out:
+        for line in smi_out.split("\n"):
+            print(f"  {line.strip()}")
+    else:
+        print("  无法获取 nvidia-smi 信息")
+
+    # Summary
+    print(f"\n{'=' * 70}")
+    if all_done:
+        print("  结论: 全部 4 GPU 训练已完成")
+    else:
+        print("  结论: 训练仍在进行中")
     print("=" * 70)
 
-    stdin, stdout, stderr = client.exec_command(
-        "nvidia-smi --query-gpu=index,name,utilization.gpu,memory.used,memory.total,temperature.gpu --format=csv,noheader"
-    )
-    smi_output = stdout.read().decode().strip()
-    if smi_output:
-        print(f"\n{'GPU':<6} {'Name':<30} {'Util':<8} {'Memory':<20} {'Temp':<8}")
-        print("-" * 75)
-        for line in smi_output.split("\n"):
-            parts = [p.strip() for p in line.split(",")]
-            if len(parts) >= 5:
-                idx, name, util, mem_used, mem_total, temp = parts
-                mem_str = f"{mem_used} / {mem_total}"
-                print(f"GPU {idx:<2} {name:<30} {util:<8} {mem_str:<20} {temp:<8}")
-
-    print("\n" + "=" * 70)
-
-    if all_done:
-        print("\n全部 GPU 训练已完成！无 train_v5 进程运行中。")
-
-        stdin, stdout, stderr = client.exec_command(
-            "ls -lt /home/jiaqigu/*.log 2>/dev/null | head -1 | awk '{print $6, $7, $8, $9}'"
-        )
-        log_info = stdout.read().decode().strip()
-        if log_info:
-            print(f"最近修改的日志文件: {log_info}")
-
-        for gpu_id in range(4):
-            cmd = f"tmux capture-pane -t gpu{gpu_id} -p | grep -i 'finished\|done\|complete\|cost\|time' | tail -3"
-            stdin, stdout, stderr = client.exec_command(cmd)
-            tail_out = stdout.read().decode().strip()
-            if tail_out:
-                print(f"\n[GPU {gpu_id}] 完成信息:")
-                print(tail_out)
-    else:
-        print(f"\n检测到 train_v5 进程仍在运行:")
-        for line in train_procs.split("\n"):
-            print(f"  {line}")
-
 except Exception as e:
-    print(f"连接错误: {e}")
+    print(f"[FAIL] SSH 连接或执行失败: {e}")
 finally:
-    client.close()
+    ssh.close()

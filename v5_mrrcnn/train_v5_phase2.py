@@ -19,7 +19,7 @@ APPROX_DISEASE_FREQ = [
 ]
 
 
-def alignment_loss_fn(vt, text_embeds, enc, freq_weights):
+def alignment_loss_fn(vt, text_embeds, enc, freq_weights, pad_mask):
     """
     Symmetric disease-aware alignment via shared cross-attention.
 
@@ -31,9 +31,10 @@ def alignment_loss_fn(vt, text_embeds, enc, freq_weights):
     if te.shape[1] == 0:
         return torch.tensor(0.0, device=vt.device, requires_grad=True)
 
-    te_37 = enc.disease_proj(te)
+    te_37 = enc.disease_proj(te, key_padding_mask=pad_mask)
     w = freq_weights.to(vt.device).float().view(1, 37, 1)
-    return F.mse_loss(vt.float() * w, te_37 * w)
+    se = (vt.float() - te_37).pow(2)
+    return (se * w).sum() / se.numel()
 
 
 def collate_fn(batch):
@@ -203,8 +204,9 @@ def train(args):
                                  padding=True, truncation=True,
                                  max_length=args.max_text_len)["input_ids"]
                 text_embeds = emb(target_ids).to(dev)
+                pad_mask = (target_ids == tok.pad_token_id).to(dev)
 
-                loss = alignment_loss_fn(vt, text_embeds, enc, freq_weights_norm)
+                loss = alignment_loss_fn(vt, text_embeds, enc, freq_weights_norm, pad_mask)
                 loss = loss / args.ga_steps
                 if loss.requires_grad:
                     loss.backward()
@@ -256,6 +258,12 @@ def train(args):
             opt.zero_grad(set_to_none=True)
 
         log(f"Epoch {epoch} done. avg_loss: {epoch_loss/max(1,step+1):.4f}")
+        avg_loss = epoch_loss / max(1, step + 1)
+        if avg_loss < best_loss:
+            best_loss = avg_loss
+            save_checkpoint(enc, opt, sched, epoch, global_step,
+                            best_loss, log_dir / "phase2_best.pt")
+            log(f"  New best loss: {best_loss:.6f}")
 
     log("Phase 2 finished.")
     log_f.flush()

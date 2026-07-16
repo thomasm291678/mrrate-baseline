@@ -3,7 +3,7 @@ from pathlib import Path
 import torch, torch.nn as nn
 import torch.nn.functional as F
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from encoder_v5 import ReportingModelV5, MRRCNN
 from mrrate_dataset import MRRateDataset
 
