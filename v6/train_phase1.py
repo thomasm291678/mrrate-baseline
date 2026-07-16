@@ -132,11 +132,6 @@ def train(args):
     log(f"Params: {total:,} total  {trainable:,} trainable")
     log(f"Tokens per modality: {n_tokens_per_mod}")
 
-    try:
-        enc = torch.compile(enc, mode="reduce-overhead", dynamic=False)
-        log("Encoder compiled (reduce-overhead)")
-    except Exception as e:
-        log(f"torch.compile skipped: {e}")
 
     opt = torch.optim.AdamW(
         [p for p in enc.parameters() if p.requires_grad],
